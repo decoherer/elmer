@@ -1,17 +1,18 @@
 import numpy as np
-from numpy import pi,sin,cos,exp,abs,inf,nan
+from numpy import pi,sin,cos,exp,abs,inf,nan,sqrt
 from wavedata import Wave,Wave2D,wrange,profile,excelcolumn,csvcolumns,deal,loadvna,dotdict,widths2grid,timeit,track
 from plot import plot,multiplot,multiplots
-from sellmeier import index,pidbm
+from sellmeier import index,groupindex,pidbm
 import modes
 import joblib
 np.seterr(divide='ignore')
-memory = joblib.Memory('j:/backup', verbose=0) # use as @memory.cache
-relativepermittivity = {'ktp':(13,13),'xcutln':(28,43),'xcutmgln':(28,43),'ln':(43,28),'mgln':(43,28),'tfln':(28,43),'isoln':34.7,
-    'xcutlndc':(29,85),'lndc':(85,29),'mglndc':(85,29),'tflndc':(29,85),'isolndc':49.6,
-    'air':1,'corning7070':4.1,'newsub':4.6,'buffer':4,'epoxy':4,'silica':3.9,'atp silica':3.826,'sio2':3.9,'sio₂':3.9,'quartz':4,' ':4,'':4,'sub':4,
-    'silicon':11.7,'aluminum nitride':8.6,'alumina':9,'fr4':4.35,'bcb':2.57} # relativepermittivity = (εy,εz) = (horiz,vert), dc = unclamped ε values
-conductivity = {'aluminum':38.16,'chromium':38.46,'copper':58.13,'gold':40.98,'nickel':14.49,'silver':61.73,'tungsten':18.25,} # 1/(Ω·µm) # from Pozar Appendix G
+memory = joblib.Memory('c:/backup', verbose=0) # use as @memory.cache
+drelativepermittivity = {'ktp':(13,13),'xcutln':(28,43),'xcutmgln':(28,43),'ln':(43,28),'mgln':(43,28),'tfln':(28,43),'isoln':34.7,
+    'xcutlndc':(29,85),'lndc':(85,29),'mglndc':(85,29),'tflndc':(29,85),'isolndc':49.6,'zproplndc':(85,85),'zpropln':(43,43),
+    'air':1,'corning7070':4.1,'newsub':4.6,'buffer':4,'epoxy':4,'epoxy2':4.9,'silica':3.9,'atp silica':3.826,'sio2':3.9,'sio₂':3.9,'quartz':4,'quartzhigh':4.63,' ':4,'':4,'sub':4,
+    'silicon':11.7,'si':11.7,'aluminum nitride':8.6,'alumina':9,'fr4':4.35,'bcb':2.57,'ro4003':3.55,'ro4350':3.66} # relativepermittivity = (εy,εz) = (horiz,vert), dc = unclamped ε values
+def relativepermittivity(material): return drelativepermittivity[material] if material in drelativepermittivity else float(material.strip('ε')) if isinstance(material,str) else material
+conductivity = {'aluminum':38.16,'chromium':38.46,'copper':58.13,'gold':40.98,'nickel':14.49,'silver':61.73,'tungsten':18.25,'platinum':9.52,'nichrome':1} # 1/(Ω·µm) # from Pozar Appendix G
 losstangent = {'alumina':0.0003,'fusedquartz':0.0001,'pyrex':0.0054,'silicon':0.0040,'teflon':0.0004,'silicondioxide':0.0008,'corning7070':0.0006} # from Pozar Appendix H # SiO2 from https://arxiv.org/pdf/2304.01362.pdf # https://www.rfcafe.com/references/electrical/dielectric-constants-strengths.htm
 # cachefolder = 'd:/cache/elmer/'
 cachefolder = 'c:/temp/elemercache'
@@ -67,6 +68,10 @@ class Electrode():
     def __init__(self, material, layers, gridx, gridy, gridnum, stretch=100, margin=10, modeargs=None):  # layers are listed bottom to top (sublisted left to right)
         # print( '\nmaterial',material, '\nlayers',layers, '\ngridx',gridx, '\ngridy',gridy, '\ngridnum',gridnum)
         # self.args = {k:v for k,v in locals().items() if not 'self'==k}
+        assert hasattr(material,'items') and hasattr(layers,'__len__') and hasattr(gridx,'__len__') and hasattr(gridy,'__len__'), 'material must be dict, layers/gridx/gridy must not be generator'
+        iz = [i for i,(y0,y1) in enumerate(zip(gridy[:-1],gridy[1:])) if y0==y1]
+        for i in iz[::-1]: # delete zero-thickness layers
+            gridy,layers = gridy[:i]+gridy[i+1:],layers[:i]+layers[i+1:]
         self.material,self.layers,self.gridx,self.gridy,self.gridnum,self.stretch,self.margin,self.modeargs = material,layers,gridx,gridy,gridnum,stretch,margin,modeargs
         self.xstretch,self.ystretch = None,None
         assert 'hot' in self.id() and 'ground' in self.id(), f'hot and ground must be defined: {material}'
@@ -75,12 +80,17 @@ class Electrode():
         self.loss_ = None
         self.md_,self.ii_ = None,None
     def legendtext(self,xoffset=None,loss=True):
-        s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.2f}'
+        s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.3f}'
         if self.modeargs is None:
             return s
-        s += (f', $n_{{IR}}$={self.nir():.2f}\nVπ={self.vpis()(xoffset):.1f}V·cm at x={xoffset:.1f}µm' if xoffset is not None else 
-              f', $n_{{IR}}$={self.nir():.2f}\nVπ={self.vpi():.1f}V·cm at x={self.bestoffset():.1f}µm')
-        return s + f'\nloss={self.rfloss():.2f}dB/cm/√GHz' if loss else s
+        s += (f', $n_{{gIR}}$={self.nir():.2f}\nVπ={self.vpis()(xoffset):.1f}V·cm at x={xoffset:.1f}µm' if xoffset is not None else 
+              f', $n_{{gIR}}$={self.nir():.2f}\nVπ={self.vpi():.1f}V·cm at x={self.bestoffset():.1f}µm')
+        if loss:
+            try :
+                s += f'\nloss={self.rfloss():.2f}dB/cm/√GHz'
+            except:
+                pass
+        return s
     def savetext(self): return f'electrode' # 'gap-hot-gap, {hot}µm hot, {metal}µm metal, 10µm LN on {substrate}'
     def dielectrics(self):
         return {k:v for k,v in self.material.items() if self.material[k] not in ['hot','ground']}
@@ -90,8 +100,9 @@ class Electrode():
         # return [{'x':self.gridx[1]-self.margin/2,'y':min(self.gridy[i+1],self.gridy[-2]+self.margin)-self.margin/2,'s':self.material[ks[0]]} for i,ks in enumerate(self.filledoutlayers()) if 'hot' not in [self.material[ks[j]] for j in range(len(ks))]] # self.material[ks[len(ks)//2]] not in ['hot','ground']]
         gx,gy,mm = np.array(self.gridx), np.array(self.gridy), 0.5*(margin if margin is not None else self.margin)
         gx,gy = [np.clip(x,gx[1:-1].min()-mm,gx[1:-1].max()+mm) for x in gx], [np.clip(y,gy[1:-1].min()-mm,gy[1:-1].max()+mm) for y in gy]
-        return [{'x':gx[1]-mm, 'y':0.5*(gy[i]+gy[i+1]), 's':self.material[ks[0]], 'verticalalignment':'center'} 
+        ss = [{'x':gx[1]-mm, 'y':0.5*(gy[i]+gy[i+1]), 's':self.material[ks[0]], 'verticalalignment':'center'} 
             for i,ks in enumerate(self.filledoutlayers()) if 'hot' not in [self.material[ks[j]] for j in range(len(ks))]]
+        return [s for i,s in enumerate(ss) if i==0 or s['s']!=ss[i-1]['s']] # only label when material changes
     def filledoutlayers(self): # e.g. input: [1,2,[1,3,1]], output: [[1 1 1][2 2 2][1 3 1]]
         rowlength = max([len(a) for a in self.layers if hasattr(a,'__len__')])
         return np.array([(a if hasattr(a,'__len__') else [a for _ in range(rowlength)]) for a in self.layers]).astype(int)
@@ -109,11 +120,19 @@ class Electrode():
         return ii,jj,min(d,0.5*metalmindim-1e-6)
     def shrinkmetal(self,f,metal):
         ii,jj,d = self.shrinkindices(f,metal=metal)
-        def isadjacent(ii):
-            return any(i0+1==i1 for i0,i1 in zip(ii[:-1],ii[1:]))
-        assert not isadjacent(ii) and not isadjacent(jj), 'adjacent metal tiles not yet supported'
-        def shrinkgrid(grid,ii): # grid = gridx or gridy, ii = indices to shrink in size
-            return [((g if 0==i else g+d) if i in ii else (g if len(grid)-1==i else g-d) if i-1 in ii else g) for i,g in enumerate(grid)]
+        # def isadjacent(ii): return any(i0+1==i1 for i0,i1 in zip(ii[:-1],ii[1:]))
+        # assert not isadjacent(ii) and not isadjacent(jj), 'adjacent metal tiles not yet supported'
+        # def shrinkgrid(grid,ii): # grid = gridx or gridy, ii = indices to shrink in size
+        #     return [((g if 0==i else g+d) if i in ii else (g if len(grid)-1==i else g-d) if i-1 in ii else g) for i,g in enumerate(grid)]
+        def shrinkgrid(grid, ii): # support adjacent metal tiles
+            out = list(grid)
+            for i in range(1, len(grid)-1):          # never touch outer domain boundary
+                left, right = (i-1) in set(ii), i in set(ii)
+                if   right and not left:  out[i] = grid[i] + d   # left edge of metal block
+                elif left  and not right: out[i] = grid[i] - d   # right edge of metal block
+                # both metal  → interior partition, don't shift
+                # neither     → bulk dielectric grid line, don't shift
+            return out
         gridx = shrinkgrid(self.gridx,ii)
         gridy = shrinkgrid(self.gridy,jj)
         return gridx, gridy
@@ -138,8 +157,22 @@ class Electrode():
         rh = 1e4/conductivity['gold']/self.materialarea('hot')
         # print('\n',' rg',rg,'Ω/cm ground','\n',' rh',rh,'Ω/cm hot','\n',' r',rh+rg,'Ω/cm total')
         return rg+rh
-    def resistance(self,f): # in Ω/cm
+    def resistance(self,f): # in Ω/cm, f in GHz
         return self.dcresistance() + 2 * self.Z * loss2α(np.sqrt(f)*self.rfloss())
+    def dcinductance(self): # in nH/cm, f in GHz
+        µ0 = 4*pi # in nH/cm
+        Lint = 0.5*µ0*self.metal/self.hot # for more accuracy replace hot with an effective hot width that depends on the specific geometry
+        return Lint + self.L
+    def inductance(self,f): # in nH/cm, f in GHz
+        µ0 = 4*pi # in nH/cm
+        κ = self.metal/skindepth(f+1e-99,metal='gold')
+        Lint = 0.5*µ0*self.metal/self.hot / κ * (np.sinh(κ)+np.sin(κ)) / (np.cosh(κ)+np.cos(κ))
+        return Lint + self.L
+    def impedance(self,f): # in Ω, f in GHz
+        return self.Z * sqrt(self.inductance(f)/self.L)
+    def rfindex(self,f): # unitless, f in GHz
+        return self.nrf * sqrt(self.inductance(f)/self.L)
+
     def materialindices(self,s='hot'):
         def layersexpanded(self):
             return [(row if hasattr(row,'__len__') else (len(self.gridx)-1)*[row]) for row in self.layers]
@@ -182,13 +215,18 @@ class Electrode():
         return self.results_
     def __getattr__(self,name):
         name = 'v' if 'potential'==name else name
-        if name in ['C','L','Z','Z0','nrf','v','ex','ey','dvdx','dvdy','xx','yy']:
+        if name in ['C','L','Z','Z0','nrf','v','ex','ey','dvdx','dvdy','xx','yy','eed']:
             return self.results()[name]
         if name in ['λ','sell']:
             return self.modeargs[name]
         assert 0, f'{name} is not a property of Electrode'
     def minres(self): return np.diff(self.xx).min(),np.diff(self.yy).min()
-    def md(self):
+    def md(self,λ=None):
+        if λ is not None:
+            assert self.modeargs is not None
+            modeargs = self.modeargs.copy()
+            modeargs.update({'λ':λ})
+            return modes.modesolver(**modeargs)
         if self.md_ is None:
             self.md_ = self.modeargs['md'] if 'md' in self.modeargs else modes.modesolver(**self.modeargs)
         return self.md_
@@ -197,8 +235,12 @@ class Electrode():
             ii = self.md().ee**2
             self.ii_ = ii[:,:int(ii.y2p(-1e-3))+1] # exclude y>=0  ## also limit ii to x and y range where ii is greater than some cutoff (for speed)?
         return self.ii_
-    def nir(self):
-        return self.md().neff
+    def nir(self,legacy=False,Δλ=10):
+        if legacy:
+            return self.md().neff
+        def groupindexfromΔn(λ0,Δλ,n0,Δn): # group index ng = n - λ(dn/dλ) ≈ n - λ(n(λ+Δλ)-n(λ))/Δλ
+            return n0 - λ0*Δn/Δλ
+        return groupindexfromΔn(self.λ, Δλ, self.md().neff, self.md(λ=self.λ+Δλ).neff-self.md().neff)    
     def bestlength(self,f): # in mm # electrode length for best Vpi (no rf loss)
         return 1000*299792458/(2*1e9*f*np.abs(self.nrf-self.nir()))
     def efield(self):
@@ -241,7 +283,7 @@ class Electrode():
         phase = 2*np.pi*(eodn)*1e10/λ
         return phase
     def vpis(self,dead=False,xs=None):
-        xs = np.linspace(-100,100,2001) if xs is None else xs
+        xs = np.linspace(-200,200,2001) if xs is None else xs
         fs = Wave(abs(self.overlapintegralgamma(1,xs,'cubic',dead=dead)),xs) # field seen by mode assuming 1 volt applied
         λ,sell = self.modeargs['λ'],self.modeargs['sell']
         r33 = 32 if sell.startswith('tfln') or sell.startswith('ln') else {'ktp':36.3,'ln':32,'mgln':32,'mglnridge':32,'mglnridgez':32}[sell]
@@ -256,20 +298,79 @@ class Electrode():
         C = 10**(abs(db)/20) * 10/length
         # print(f"notdead:{self.vpis(dead=0).min():g}, dead:{self.vpis(dead=1).min():g}, vpi:{self.vpis(dead=dead).min():g}")
         return C*self.vpis(dead=dead).min() if xoffset is None else C*self.vpis(dead=dead,xs=np.array([xoffset])).atx(xoffset,monotonicx=False)
-    def bandwidth(self,length,loss,za=50,zt=None,fmax=40,df=0.01,plot=0,dbm=False,xoffset=None,dead=False,verbose=True):
-        def pidbm(vpi,Z=50): # power in dBm for peak-to-peak π phase shift
-            return 10*np.log10(125*vpi**2/Z)
+    def bandwidth(self,length=None,loss=None,za=50,zt=None,fmax=40,df=0.01,plot=0,dbm=False,volts=False,xoffset=None,dead=False,verbose=True,ng=None):
+        length = length if length is not None else self.length
+        loss = loss if loss is not None else self.rfloss()
+        assert length is not None and loss is not None
         zt = zt if zt is not None else self.Z
-        self.d = rfbandwidth(Z=self.Z,nrf=self.nrf,loss=loss,za=za,zt=zt,lengthinmm=length,λ=self.λ,sell=self.sell+'wg',fmax=fmax,df=df,plot=plot)
-        if dbm:
+        za = za if za is not None else self.Z+1e-9
+        ng = ng if ng is not None else self.nir()
+        # self.d = rfbandwidth(Z=self.Z,nrf=self.nrf,loss=loss,za=za,zt=zt,lengthinmm=length,λ=self.λ,sell=self.sell+'wg',fmax=fmax,df=df,plot=plot)
+        self.d = rfbandwidth(Z=self.Z,nrf=self.nrf,loss=loss,za=za,zt=zt,lengthinmm=length,λ=self.λ,ng=ng,fmax=fmax,df=df,plot=plot)
+        if dbm or volts:
+            def pidbm(vpi,Z=50): # power in dBm for peak-to-peak π phase shift
+                return 10*np.log10(125*vpi**2/Z)
+            def dbm2volts(dbm,Z):
+                return np.sqrt(10**(0.1*dbm)/125*Z)
             ## power required for peak-to-peak phase of π
             ## Vpp = Vπ, Vrms = Vpp/(2√2) # P(W) = Vrms²/Z = ⅛Vpp²/Z
             ## P(dBm) = 10×log10(1000×P(W)) = 10×log10(125×Vpp²/Z)
             vπ = self.vpi(xoffset=xoffset,length=length,dead=dead)
             if verbose: print('vπ',vπ,'Z',self.Z,'nrf',self.nrf)
             assert pidbm(vπ,self.Z)==10*np.log10(125*vπ**2/self.Z)
-            return pidbm(vπ,self.Z) - self.d['coprop']
+            return pidbm(vπ,self.Z)-self.d['coprop'] if dbm else dbm2volts(pidbm(vπ,self.Z)-self.d['coprop'],self.Z)
         return self.d
+    def rfbw(self,lengthinmm=30,za=50,zt=50,R=None,L=None,C=None,neff=None):
+        fs = wrange(0,100,0.001); fs[0] += 1e-9
+        wr = Wave(self.resistance(fs) if R is None else R+0*fs,fs)
+        wl = Wave(self.inductance(fs) if L is None else L+0*fs,fs)
+        wc = Wave(self.C+0*fs if C is None else C+0*fs,fs)
+        wz = sqrt(1000*wl/wc)
+        def gammaz(R,L,C,lengthinmm,Δn=0): # R,L,C in Ω/cm,nH/cm,pF/cm, nonzero Δn used for rf vs optical mismatch
+            Δβpercm = 0.01*2*np.pi*1e9*fs/299792458*Δn # cm⁻¹
+            γ = sqrt(R+1j*2*pi*1e9*fs*L*1e-9) * sqrt(1j*2*pi*1e9*fs*C*1e-12) # cm⁻¹ # γ = α + jβ
+            return (γ + 1j*Δβpercm) * (lengthinmm/10)
+        # wnrf = (gammaz(wr,wl,wc,lengthinmm) / (lengthinmm/10)).imag() * 0.299792458 / (2*np.pi*fs); wn = Wave(self.rfindex(fs),fs); wnrf0 = self.nrf + 0*wnrf
+        # Wave.plot(100*wnrf[4:],wnrf0[4:],wn[4:],c='0k1',l='031',xlim=(0,fs[-1]),ylim=(2.2,2.4),x='f (GHz)',y='nrf',grid=1,seed=3) # plot comparison of three different nrf
+        def rfprop(za,Z,zt,γ): # za = input impedance, Z = electrode impedance, zt = termination impedance
+            g,ge = (zt-Z)/(zt+Z),np.exp(-γ)
+            ga = ( 1/ge-g*ge )/( 1/ge+g*ge ) * za/Z
+            ga = (1-ga)/(1+ga)
+            gb = (1+g)*(1+ga)/( 1/ge+g*ge )
+            return g,ge,ga,gb
+        def opprop(g,ge,ga,γ1,γ2):
+            return ((np.exp(+γ1+1e-99)-1)/(+γ1+1e-99) + g*(np.exp(-γ2)-1)/(-γ2)) * (1+ga)/( 1/ge+g*ge )
+        def dbwave(y,name=''):
+            return Wave(20*np.log10(abs(y)),fs,name)
+        g,ge,ga,gb = rfprop(za,wz,zt,gammaz(wr,wl,wc,lengthinmm,0))
+        s11 = dbwave(ga,'RF, |S11|')
+        s21 = dbwave(gb,'RF, |S21|')
+        neff = neff if neff is not None else self.md().neff
+        op = dbwave( opprop(g,ge,ga,gammaz(wr,wl,wc,lengthinmm,-neff),gammaz(wr,wl,wc,lengthinmm,+neff)),'optical, co-prop' )
+        opc = dbwave( opprop(g,ge,ga,gammaz(wr,wl,wc,lengthinmm,+neff),gammaz(wr,wl,wc,lengthinmm,-neff)),'optical, counter-prop' )
+        return s11,s21,op,opc
+    def integratedenergy(self, mask=None, boundary=None): # mask by tileid (int) or material (str), boundary is 'open' or 'closed' for whether to include boundary points in the integral
+        if boundary is None:
+            return 0.5*self.integratedenergy(mask=mask,boundary='open') + 0.5*self.integratedenergy(mask=mask,boundary='closed')
+        xx,yy = self.eed.xx,self.eed.yy
+        m = self.eed*0
+        if mask is None: return self.eed.volume(simple=0)
+        ij = [(i,j) for j,row in enumerate(self.filledoutlayers()) for i,v in enumerate(row) if v==mask] if isinstance(mask, int) else self.materialindices(mask)
+        for i,j in ij:
+            x0,x1 = self.gridx[i],self.gridx[i+1]
+            y0,y1 = self.gridy[j],self.gridy[j+1]
+            # m += (x0<=xx)*(xx<x1)*(y0<=yy)*(yy<y1)
+            m += (x0<xx)*(xx<x1)*(y0<yy)*(yy<y1) if boundary=='open' else (x0<=xx)*(xx<=x1)*(y0<=yy)*(yy<=y1)
+        return (self.eed*m).volume(simple=0)
+    def integratedenergytest(self):
+        ε0 = 0.088541878188 # pF/cm
+        print(2*ε0*self.integratedenergy(mask=None),'pF/cm') # total integrated energy = ½CV² with V=1V
+        print(self.C,'pF/cm')
+    def G(self,material,σ): # σ in S/cm = 1/ρ with ρ in Ω/cm
+        Ceff = 2*self.integratedenergy(mask=material) # in units of ε0
+        εr = relativepermittivity(material.lower())
+        return Ceff*σ/εr # in units of S/cm
+    # α = ½GZ₀ from conductance per unit length G, α = ½R/Z₀ from resistance per unit length R, effective resistance Reff = GZ₀² when α is small
     def plotlimits(self,xlim,ylim,aspect=None):
         gx,gy,mm = self.gridx,self.gridy,self.margin
         xlim,ylim = (gx[1]-mm,gx[-2]+mm) if xlim is None else xlim,(gy[1]-mm,gy[-2]+mm) if ylim is None else ylim
@@ -308,14 +409,14 @@ class Electrode():
                     if not gs[j][i]==gs[j+1][i]:
                         yield {'xdata':(x0,x1),'ydata':(y,y),'color':'k','linewidth':0.5} # yield plt.Line2D((x0,x1),(y,y),color='k')#,lw=2.5)
         return list(lines())
-    def plot(self,texts=None,savetext='',xlim=None,ylim=None,**kwargs):
+    def plot(self,texts=None,savetext='',xlim=None,ylim=None,legendtext=None,corner='upper right',**kwargs):
         # gx,gy,mm = self.gridx,self.gridy,self.margin
         # # xlim,ylim = (1.5*gx[1]-0.5*gx[2],1.5*gx[-2]-0.5*gx[-3]),(1.5*gy[1]-0.5*gy[2],1.5*gy[-2]-0.5*gy[-3])
         # xlim,ylim = (gx[1]-mm,gx[-2]+mm) if xlim is None else xlim,(gy[1]-mm,gy[-2]+mm) if ylim is None else ylim
         xlim,ylim = self.plotlimits(xlim,ylim,aspect='aspect' in kwargs)
         self.potential.plot(contourf=1,x='µm',y='µm',lines=self.plotlines(),
             texts=self.materialtext() if texts is None else texts,
-            legendtext=self.legendtext(),corner='upper right',xlim=xlim,ylim=ylim,
+            legendtext=legendtext if legendtext is not None else self.legendtext(),corner=corner,xlim=xlim,ylim=ylim,
             save='potential'+(', '+savetext if savetext else ', '+self.savetext()),**kwargs)
     def __str__(self):
         return f'C={self.C:.3f}pF/cm, L={self.L:.3f}nH/cm, Z={self.Z:.2f}Ω, Z0={self.Z0:.2f}Ω, nrf={self.nrf:.3f}'
@@ -392,9 +493,9 @@ class XcutElectrode(Electrode):
         return Wave(gaps,zs)(z,extrapolate=extrapolate)
     def legendtext(self,xoffset=None):
         return f"{self.gap}-{self.hot}-{self.gap} gap-hot-gap\n" + super().legendtext(xoffset)
-        # f"Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm, L={self.L:.2f}nH/cm\n$n_{{IR}}$={self.nir():.2f}, $n_{{RF}}$={self.nrf:.2f}\nVp={self.vpi():.1f}V·cm at x={self.bestoffset():.1f}µm"
+        # f"Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm, L={self.L:.2f}nH/cm\n$n_{{gIR}}$={self.nir():.2f}, $n_{{RF}}$={self.nrf:.2f}\nVp={self.vpi():.1f}V·cm at x={self.bestoffset():.1f}µm"
     def savetext(self):
-        return f'{self.gap}-{self.hot}-{self.gap} gap-hot-gap, {self.hot}µm hot, {self.metal}µm metal'+('' if self.buffer is None else f', {self.buffer}µm buffer')+f', {self.film}µm LN on {self.substrate}'
+        return f'{self.gap}-{self.hot}-{self.gap} gap-hot-gap, {self.metal}µm metal'+('' if self.buffer is None else f', {self.buffer}µm buffer')+f', {self.film}µm LN on {self.substrate}'
 class TflnRidgeElectrode(Electrode):
     def __init__(self, gap,metal,film,substrate, gridsize=500, gridnum=36000, modeargs=None):
         material, layers = {1:substrate,2:'TFLN',3:'air',4:'hot',5:'ground'}, [1,[3,4,2,5,3],3]
@@ -450,16 +551,19 @@ class SetbackElectrode(XcutElectrode):
         print('        gap,Z:',gaps,zs)
         return Wave(gaps,zs)(z,extrapolate=extrapolate)
 class AbuttingRidgeCPS(Electrode):
-    def __init__(self,width=2,hot=10,film=4,etch=3,metal=None,substrate='quartz',buffer=1.0,buffermaterial='SiO2',gridsize=500,gridnum=36000,modeargs=None,λ=1550):
+    def __init__(self,width=2,hot=10,film=4,etch=3,metal=None,substrate='quartz',buffer=1.0,buffermaterial='SiO2',carrier='SiO2',carrierdepth=0,gridsize=500,gridnum=36000,modeargs=None,λ=1550):
         metal = metal if metal is not None else etch
         assert etch<=film and etch<=metal
-        material = {1:substrate,2:'xcutLN',3:buffermaterial,4:'air',5:'hot',6:'ground'}
+        material = {1:substrate,2:'xcutLN',3:buffermaterial,4:'air',5:carrier,6:'hot',7:'ground'}
         gridx = [-gridsize, -width/2-buffer-hot, -width/2-buffer, -width/2, width/2, width/2+buffer, width/2+buffer+hot, gridsize]
         gridy = [-gridsize,-film,-etch,0,gridsize] if metal==etch else [-gridsize,-film,-etch,0,metal-etch,gridsize]
-        layers = [1,2,[4,6,3,2,3,5,4],4] if metal==etch else [1,2,[4,6,3,2,3,5,4],[4,6,4,4,4,5,4],4]
+        layers = [1,2,[4,7,3,2,3,6,4],4] if metal==etch else [1,2,[4,7,3,2,3,6,4],[4,7,4,4,4,6,4],4]
         if film==etch:
             gridy = [-gridsize,-film,0,gridsize] if metal==etch else [-gridsize,-film,0,metal-etch,gridsize]
-            layers = [1,[4,6,3,2,3,5,4],4] if metal==etch else [1,[4,6,3,2,3,5,4],[4,6,4,4,4,5,4],4]
+            layers = [1,[4,7,3,2,3,6,4],4] if metal==etch else [1,[4,7,3,2,3,6,4],[4,7,4,4,4,6,4],4]
+        if carrierdepth:
+            gridy = gridy[:1] + [-carrierdepth-film] + gridy[1:]
+            layers = [5] + layers
         modeargs = modeargs if modeargs is not None else dict(λ=λ,width=width,depth=film,ape=etch,rpe=0,xcut=1,
             res=0.1,limits=(-10,10,-10,2),sell='lnridgez',method='isotropic',cachelookup=1,verbose=1,nummodes=5)
         Electrode.__init__(self, material, layers, gridx, gridy, gridnum, modeargs=modeargs)
@@ -473,7 +577,7 @@ class AbuttingRidgeCPS(Electrode):
         s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.2f}'
         if self.modeargs is None:
             return s
-        return s + f', $n_{{IR}}$={self.nir():.2f}\nVπ={self.vpi(xoffset=0):.2f}V·cm' + bool(xoffset)*f' at x={self.bestoffset():.1f}µm'
+        return s + f', $n_{{gIR}}$={self.nir():.2f}\nVπ={self.vpi(xoffset=0):.2f}V·cm' + bool(xoffset)*f' at x={self.bestoffset():.1f}µm'
 class RidgeCPS(Electrode):
     def __init__(self, gap=5,hot=10,metal=5,width=3,film=3,etch=2,substrate='quartz',buffer=0.2, gridsize=500, gridnum=36000, modeargs=None,λ=1550):
         assert buffer < etch < film < metal, f"buffer < etch < film < metal, {buffer} < {etch} < {film} < {metal}"
@@ -496,7 +600,7 @@ class RidgeCPS(Electrode):
         s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.2f}'
         if self.modeargs is None:
             return s
-        return s + f', $n_{{IR}}$={self.nir():.2f}\nVp={self.vpis()(xoffset):.1f}V·cm'
+        return s + f', $n_{{gIR}}$={self.nir():.2f}\nVp={self.vpis()(xoffset):.1f}V·cm'
     def savetext(self):
         return f'{self.hot:g}-{self.gap:g}-{self.hot:g} electrode, {self.λ}nm {self.width:g}x{self.etch:g}µm ridge on {self.film:g}µm TFLN on {self.substrate}'+f', {self.buffer:g}µm buffer'*(1e-2<self.buffer)
     def plotmode(self,xoffset=None,savetext='',xlim=None,ylim=None,materialtext=None,**kwargs):
@@ -536,7 +640,7 @@ class RidgeElectrode(Electrode):
         s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.2f}'
         if self.modeargs is None:
             return s
-        return s + f', $n_{{IR}}$={self.nir():.2f}\nVp={self.vpis()(0):.1f}V·cm'
+        return s + f', $n_{{gIR}}$={self.nir():.2f}\nVp={self.vpis()(0):.1f}V·cm'
 class OverhangRidgeElectrode(Electrode):
     def __init__(self, gap,hot,metal,width,film,substrate,crush,buffer2, submount='SiO2', gridsize=500, gridnum=36000, modeargs=None, deepdice=0):
         assert width<hot
@@ -546,7 +650,6 @@ class OverhangRidgeElectrode(Electrode):
         if deepdice:
             layers = [1,[4,4,4,1,4,4,4],[4,4,4,3,4,4,4],[4,4,4,2,4,4,4],4,[7,4,6,6,6,4,7],5]
             gridy = [-gridsize,-deepdice-buffer2-film,-buffer2-film,-film,0,crush,crush+metal,gridsize]
-
         modeargs = modeargs if modeargs is not None else {'λ':1550,'width':film,'depth':film,'ape':film,'rpe':0,'xcut':0,
             'res':0.2,'sell':'mglnridge','plotmode':0,'cachelookup':1,'verbose':1}
         Electrode.__init__(self, material, layers, gridx, gridy, gridnum, modeargs=modeargs)
@@ -561,7 +664,7 @@ class OverhangRidgeElectrode(Electrode):
         s = f'Z={self.Z:.1f}Ω\nC={self.C:.2f}pF/cm\nL={self.L:.2f}nH/cm\n$n_{{RF}}$={self.nrf:.2f}'
         if self.modeargs is None:
             return s
-        return s + f', $n_{{IR}}$={self.nir():.2f}\nVp={self.vpis()(0):.1f}V·cm'
+        return s + f', $n_{{gIR}}$={self.nir():.2f}\nVp={self.vpis()(0):.1f}V·cm'
 class XcutSubmountCPW(Electrode):
     def __init__(self,gap=20,hot=6.5,metal=3.5,buffer=0.3,film=4,etch=2,wgwidth=7,wgoffset=-10,substrate='xcutln',gridsize=500,gridnum=36000,modeargs=None):
         material = {1:'quartz',2:substrate,3:'',4:'quartz',5:'hot',6:'ground'}
@@ -587,7 +690,53 @@ class XcutSubmountCPW(Electrode):
         return super().plotmode(xoffset=xoffset,savetext=savetext,xlim=xlim,ylim=ylim,materialtext=materialtext,**kwargs)
     def legendtext(self,xoffset=None,loss=False):
         return super().legendtext(xoffset=xoffset,loss=loss)
-
+class XcutElectrodeSimpleAsym(XcutElectrode):
+    def __init__(self,gap,hot,biggap=None,metal=8,film=7,substrate='quartz',buffer=0,gridsize=1000,gridnum=36000,modeargs=None):
+        biggap = biggap if biggap is not None else gap
+        metal = metal if metal else 1e-2
+        material = {1:substrate,2:'TFLN',3:'air',4:' ',5:'hot',6:'ground'} if buffer else {1:substrate,2:'TFLN',3:'air',4:'hot',5:'ground'}
+        layers = [1,2,4,[6,3,5,3,6],3] if buffer else [1,2,[5,3,4,3,5],3]
+        gridx = [-gridsize,-biggap-hot/2,-hot/2,hot/2,gap+hot/2,gridsize]
+        gridy = [-gridsize,-film,0,buffer,buffer+metal,gridsize] if buffer else [-gridsize,-film,0,metal,gridsize]
+        Electrode.__init__(self, material, layers, gridx, gridy, gridnum, modeargs=modeargs)
+        self.gap,self.hot,self.biggap,self.metal,self.film,self.substrate,self.buffer,self.gridnum,self.gridsize,self.modeargs = gap,hot,biggap,metal,film,substrate,buffer,gridnum,gridsize,modeargs
+    def plotlimits(self,xlim,ylim,aspect=None):
+        gx,gy,mm,hot,biggap = self.gridx,self.gridy,self.margin,self.hot,self.biggap
+        xlim = (-hot-biggap-mm,hot+biggap+mm)
+        ylim = (gy[1]-mm,gy[-2]+mm) if ylim is None else ylim
+        if aspect:
+            y = max(0, 0.6*(xlim[1]-xlim[0]) - (ylim[1]-ylim[0]))
+            ylim = [ylim[0]-y/2,ylim[1]+y/2]
+        return xlim,ylim
+class XcutElectrodeSimpleAsymGnd(XcutElectrode):
+    def __init__(self,gap,hot,biggap=None,metal=8,film=7,dsub=500,dbase=100,substrate='quartz',base='epoxy2',gnd=None,gridsize=1000,gridnum=36000,modeargs=None):
+        biggap = biggap if biggap is not None else gap
+        material = {1:base,2:substrate,3:'TFLN',4:'air',5:'hot',6:'ground'}
+        layers = [6,1,2,3,[6,4,5,4,6],4] if gnd is None else [6,1,2,3,[4,6,4,5,4,6,4],4]
+        gridx = [-gridsize,-biggap-hot/2,-hot/2,hot/2,gap+hot/2,gridsize]
+        if gnd:
+            gridx = [-gridsize,-gnd-biggap-hot/2,-biggap-hot/2,-hot/2,hot/2,gap+hot/2,gnd+gap+hot/2,gridsize]
+        gridy = [-gridsize,-dbase-dsub-film,-dsub-film,-film,0,metal,gridsize]
+        Electrode.__init__(self, material, layers, gridx, gridy, gridnum, modeargs=modeargs)
+        self.gap,self.hot,self.biggap,self.metal,self.film,self.substrate,self.gnd,self.gridnum,self.gridsize,self.modeargs = gap,hot,biggap,metal,film,substrate,gnd,gridnum,gridsize,modeargs
+        self.dsub,self.dbase = dsub,dbase
+    def vpi(self,xoffset=None,dead=False,db=0,length=10): # units of V·cm by default
+        xoffset = xoffset if xoffset is not None else 0.5*(self.hot+self.gap)
+        C = 10**(abs(db)/20) * 10/length
+        # print(f"notdead:{self.vpis(dead=0).min():g}, dead:{self.vpis(dead=1).min():g}, vpi:{self.vpis(dead=dead).min():g}")
+        return C*self.vpis(dead=dead).min() if xoffset is None else C*self.vpis(dead=dead,xs=np.array([xoffset])).atx(xoffset,monotonicx=False)
+    def legendtext(self,xoffset=None):
+        return f"{self.biggap}-{self.hot}-{self.gap} gap-hot-gap\n" + Electrode.legendtext(self,xoffset)
+    def savetext(self):
+        return f'{self.biggap}-{self.hot}-{self.gap} gap-hot-gap, {self.hot}µm hot, {self.metal}µm metal, {self.film}µm LN on {self.dsub}µm {self.substrate} on {self.dbase}µm epoxy on ground'
+    def plotlimits(self,xlim,ylim,aspect=None):
+        gx,gy,mm,hot,biggap = self.gridx,self.gridy,self.margin,self.hot,self.biggap
+        xlim = (-hot-biggap-mm,hot+biggap+mm)
+        ylim = (gy[1]-mm,gy[-2]+mm) if ylim is None else ylim
+        if aspect:
+            y = max(0, 0.6*(xlim[1]-xlim[0]) - (ylim[1]-ylim[0]))
+            ylim = [ylim[0]-y/2,ylim[1]+y/2]
+        return xlim,ylim
 def electricsolve(material,gridsubs,gridx,gridy,gridnum,stretch=20,xstretch=None,ystretch=None,cachelookup=True):
     if cachelookup: return joblib.Memory(cachefolder, verbose=0).cache(electricsolve)(material,gridsubs,gridx,gridy,gridnum,stretch,xstretch,ystretch,cachelookup=False)
     assert all([x0<x1 for x0,x1 in zip(gridx[:-1],gridx[1:])]) and all([y0<y1 for y0,y1 in zip(gridy[:-1],gridy[1:])]), f'invalid grid, gridx:{gridx} gridy:{gridy}'
@@ -609,7 +758,7 @@ def electricsolve(material,gridsubs,gridx,gridy,gridnum,stretch=20,xstretch=None
     v,ey,ex,eed = [Wave2D(w.reshape(ny,nx).T,xs=xx,ys=yy) for w in [v,ey,ex,eed]]
     dvdy = Wave2D(np.diff(v,axis=1)/np.diff(v.ys)[None,:], v.xs, v.ys[1:]/2+v.ys[:-1]/2)
     dvdx = Wave2D(np.diff(v,axis=0)/np.diff(v.xs)[:,None], v.xs[1:]/2+v.xs[:-1]/2, v.ys)
-    return {'L':L,'C':C,'Z':Z,'Z0':Z0,'nrf':nrf,'v':v,'dvdy':dvdy,'ey':ey,'dvdx':dvdx,'ex':ex,'xx':xx,'yy':yy} # print(f'L={L:.3f}nH/cm, C={C:.3f}pF/cm, Z={Z:.2f}Ω, Z0={Z0:.2f}Ω, nrf={nrf:.3f}')
+    return {'L':L,'C':C,'Z':Z,'Z0':Z0,'nrf':nrf,'v':v,'dvdy':dvdy,'ey':ey,'dvdx':dvdx,'ex':ex,'xx':xx,'yy':yy, 'eed':eed} # print(f'L={L:.3f}nH/cm, C={C:.3f}pF/cm, Z={Z:.2f}Ω, Z0={Z0:.2f}Ω, nrf={nrf:.3f}')
 def runelmer(folder,elmerfolder='c:/elmer/bin/'):
     import subprocess, glob, shutil, os
     def run(command,logfile):
@@ -625,7 +774,7 @@ def loadvalues(folder):
     def names():
         with open(folder+'scalars.dat.names','r') as f:
             if not f.readline().startswith('File started'):
-                for i in range(5): f.readline()
+                for i in range(6): f.readline()
             assert f.readline().strip().startswith('Variables in columns of matrix')
             return [line.split(':')[-1].strip() for line in f] # e.g. line='   1: res: electric energy'
     def values():
@@ -803,7 +952,7 @@ def writesif(material,folder,vacuum=False):
         f.write('End\n')
         f.write('\n')
         for k,name in dielectrics.items():
-            e = 1 if vacuum else relativepermittivity[name.lower()]
+            e = 1 if vacuum else relativepermittivity(name.lower())
             f.write(f'Material {k}\n')
             f.write(f'  Name = "{name}"\n')
             if hasattr(e,'__len__'):
@@ -832,14 +981,16 @@ def clearfolder(folder): # to remove old files before running to catch elmer.exe
         os.mkdir(path)
     send2trash.send2trash(path)
     os.mkdir(path)
-def rfbandwidth(Z,nrf,loss=1.0,lengthinmm=10,λ=1064,sell='ktpwg',fmax=40,df=0.01,za=50,zt=50,R=0,legendtext='',plot=True): # loss in dB/cm/√GHz
+def rfbandwidth(Z,nrf,loss=1.0,lengthinmm=10,λ=1064,ng=None,fmax=40,df=0.01,za=50,zt=50,R=0,legendtext='',plot=True,sell=None): # loss in dB/cm/√GHz, R is Ω for total length
     # 20*log for optical response, 20*log for S11,S21 and RF loss, 10*log for |S11|² # print(Z,nrf,loss,lengthinmm,λ,sell,fmax,df,za,zt,legendtext,plot)
-    lossdc = (10*0.5*R/Z/lengthinmm)*20/np.log(10); assert 0==R, 'double check *lengthinmm or /lengthinmm here?'
+    lossdc = (10*0.5*R/Z/lengthinmm)*20/np.log(10)
     # offset in dB due to dc resistance = (0.5*R/Z)*20/np.log(10)
     # αdc = 0.5*R/Z/lengthinmm # in mm⁻¹ = 10*0.5*R/Z/lengthinmm # in cm⁻¹
     # αac = np.log(10**(0.05*loss))*np.sqrt(f) # in cm⁻¹ with loss in dB/cm
     # αdc = np.log(10**(0.05*lossdc))
-    nktp,length,c = index(λ,sell.replace('ridge',''),20),lengthinmm/1000,299792458
+    if sell is not None: print('warning: sell argument is deprecated, use group index passed directly as ng')
+    ng = groupindex(λ,sell.replace('ridge',''),20) if ng is None else ng
+    length,c = lengthinmm/1000,299792458
     x = np.array(wrange(0,fmax,df))
     x[0] += 1e-9
     def α(index):
@@ -861,24 +1012,24 @@ def rfbandwidth(Z,nrf,loss=1.0,lengthinmm=10,λ=1064,sell='ktpwg',fmax=40,df=0.0
         return Wave(20*np.log10(abs(y)),x,name)
     za, z0, zt = za+0j, Z+0j, zt+0j
     g,ge,ga,gb = rfprop(za,z0,zt,α(nrf))
-    opticalcoprop = dbwave( opprop(g,ge,ga,α(nrf-nktp),α(nrf+nktp)),'optical, co-prop' )
-    opticalcounterprop = dbwave( opprop(g,ge,ga,α(nrf+nktp),α(nrf-nktp)),'optical, counter-prop' )
+    opticalcoprop = dbwave( opprop(g,ge,ga,α(nrf-ng),α(nrf+ng)),'optical, co-prop' )
+    opticalcounterprop = dbwave( opprop(g,ge,ga,α(nrf+ng),α(nrf-ng)),'optical, counter-prop' )
     opticalvelocitymatched = dbwave( opprop(g,ge,ga,α(0),α(2*nrf)),'optical, velocity matched' )
     uu = dbwave( np.sqrt(ga*ga.conjugate() + gb*gb.conjugate()), 'RF, |S11|²+|S21|²' )
     s11 = dbwave(ga,'RF, |S11|')
     s21 = dbwave(gb,'RF, |S21|')
-    opticallossless = dbwave( opprop( *rfprop(za,z0,zt,1j*α(nrf).imag)[:3], 1j*α(nrf-nktp).imag, 1j*α(nrf+nktp).imag),'optical, no loss' )
+    opticallossless = dbwave( opprop( *rfprop(za,z0,zt,1j*α(nrf).imag)[:3], 1j*α(nrf-ng).imag, 1j*α(nrf+ng).imag),'optical, no loss' )
     def sinc(x):
         return np.sinc(x/np.pi)
+    opticallossless50ohm = dbwave( sinc(0.5*α(nrf-ng).imag),'optical, no loss 50Ω' )
+    opticallossless50ohmcounterprop = dbwave( sinc(0.5*α(nrf+ng).imag),'optical, counter-prop no loss 50Ω' )
     def bestlengthinmm(f):
-        return 1000*299792458/(2*1e9*f*(nrf-nktp))
-    opticallossless50ohm = dbwave( sinc(0.5*α(nrf-nktp).imag),'optical, no loss 50Ω' )
-    opticallossless50ohmcounterprop = dbwave( sinc(0.5*α(nrf+nktp).imag),'optical, counter-prop no loss 50Ω' )
-    opbestlen = dbwave( np.where(0.5*α(nrf-nktp).imag>pi/2, 1/(0.5*α(nrf-nktp).imag+1e-99), sinc(0.5*α(nrf-nktp).imag)),'optical, best length' ) # opticallossless50ohm with best length chosen, length = min( len, bestlength(f) )
+        return 1000*299792458/(2*1e9*f*(nrf-ng))
+    opbestlen = dbwave( np.where(0.5*α(nrf-ng).imag>pi/2, 1/(0.5*α(nrf-ng).imag+1e-99), sinc(0.5*α(nrf-ng).imag)),'optical, best length' ) # opticallossless50ohm with best length chosen, length = min( len, bestlength(f) )
     if plot: Wave.plots(opticalcoprop,opticalcounterprop,opticalvelocitymatched,opticallossless,
             opticallossless50ohm,opticallossless50ohmcounterprop,opbestlen,s11,s21,uu,
-            seed=16,x='frequency (GHz)',y='response (dB)',ylim=((np.nanmin(opticalcounterprop)//10)*10,None),
-            legendtext=(legendtext+'\n' if legendtext else '')+f'RF loss = {loss}dB/cm/√GHz',
+            grid=1,seed=16,x='frequency (GHz)',y='response (dB)',#ylim=((np.nanmin(opticalcounterprop)//10)*10,None),
+            legendtext=(legendtext+'\n' if legendtext else '')+f'RF loss = {loss:g}dB/cm/√GHz',
             save='rfbandwidth plot')
     return dotdict({'coprop':opticalcoprop,'counterprop':opticalcounterprop,'velocitymatched':opticalvelocitymatched,'s11':s11,'s21':s21,'lossless':opticallossless,'lossless50ohm':opticallossless50ohm,'lossless50ohmcounterprop':opticallossless50ohmcounterprop,'opbestlen':opbestlen,'sums11s21':uu})
 def skindepth(f,metal='gold'): # in µm, f in GHz
@@ -1032,18 +1183,19 @@ def Znrf2LC(Z,nrf):
     LoverC = Z**2/1000
     L,C = np.sqrt(LC*LoverC),np.sqrt(LC/LoverC)
     return L,C # L in nH/cm, C in pF/cm
-def cpwmglnape(g=17,h=9,buffer=0.0,loss=0.0,length=10,f0=15,term=None,air=False,λ=369,metal=4.8,gridnum=36000,gridsize=500,fmax=80):
-    modeargs = dict(λ=λ,width=5,depth=0.2 if λ<1000 else 1.0,ape=16.5,rpe=2.0,apetemp=320,rpetemp=300,sell='mgln',verbose=0)
+def cpwmglnape(g=17,h=9,buffer=0.0,loss=0.0,length=10,f0=15,term=None,air=False,λ=369,metal=4.8,gridnum=36000,gridsize=500,fmax=80,width=5,depth=None,ape=16.5,rpe=2.0,apetemp=320,rpetemp=300):
+    # modeargs = dict(λ=λ,width=5,depth=0.2 if λ<1000 else 1.0,ape=16.5,rpe=2.0,apetemp=320,rpetemp=300,sell='mgln',verbose=0)
+    depth = depth if depth is not None else 0.2 if λ<1000 else 1.0
+    modeargs = dict(λ=λ,width=width,depth=depth,ape=ape,rpe=rpe,apetemp=apetemp,rpetemp=rpetemp,sell='mgln',verbose=0)
     el = CPW(g,h,{1:'MgLN',2:' ',3:'quartz',4:'hot',5:'ground'},[1,2,[5,2,4,2,5],3],[0, buffer+1e-6, buffer+metal],gridnum,gridsize=gridsize,modeargs=modeargs)
     if air:
         el = CPW(g,h,{1:'MgLN',2:' ',3:'air',4:'hot',5:'ground'},[1,2,[5,3,4,3,5],3],[0, buffer+1e-6, buffer+metal],gridnum,gridsize=gridsize,modeargs=modeargs)
     C,L,Z,Z0,nrf = [getattr(el,a) for a in ['C','L','Z','Z0','nrf']]
-    # print('Z',Z,'nrf',nrf)
     term = term if term is not None else Z
     el.d = rfbandwidth(Z=Z,nrf=nrf,loss=loss,zt=term,lengthinmm=length,λ=modeargs['λ'],sell='mglnwg',fmax=fmax,plot=0)
     db = el.d['coprop'](f0) # in dB
-    # print(modeargs,db,'db',Z,'Ω')
     el.vpi1 = el.vpi(xoffset=0) * 10**(abs(db)/20) * 10/length
+    print('Z',Z,'nrf',nrf,db,'db',Z,'Ω','vpi1',el.vpi1,'volt·cm')
     return el
 
 if __name__ == '__main__':
@@ -1073,7 +1225,6 @@ if __name__ == '__main__':
     def gndtest():
         el = XcutElectrode(47,8,5,10,'LN',gridsize=1000,gridnum=36000)
         if plots: el.plot(pause=0,savetext='')
-        if plots: el.plotmode()
         print('gndtest1',el)
         el = XcutElectrode(47,8,5,10,'LN',gnd=100,gridsize=1000,gridnum=36000)
         print('gndtest2',el)
@@ -1083,5 +1234,6 @@ if __name__ == '__main__':
     ktptest()
     lntest()
     gndtest()
+    cpwmglnape()
 
     #todo: calculate half grid if symmetric
